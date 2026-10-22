@@ -1,0 +1,1365 @@
+local env = getgenv()
+
+-- Remove the UI-only preview when the full hub starts.
+if env.AstaHubPreview then
+    env.AstaHubPreview.running = false
+    if env.AstaHubPreview.hubGui then env.AstaHubPreview.hubGui:Destroy() end
+    for _, connection in ipairs(env.AstaHubPreview.hubConnections or {}) do
+        connection:Disconnect()
+    end
+    env.AstaHubPreview = nil
+end
+
+-- Stop the previous copy.
+local previous = env.MM2CoinCollector
+if previous then
+    previous.running = false
+    if previous.tween then previous.tween:Cancel() end
+    if previous.stopAim then previous.stopAim() end
+    if previous.espFolder then previous.espFolder:Destroy() end
+    if previous.hubGui then previous.hubGui:Destroy() end
+    for _, connection in ipairs(previous.hubConnections or {}) do
+        connection:Disconnect()
+    end
+end
+
+local state = { running = true, startedAt = os.clock(), cratesOpened = 0,
+    mode = "Starting", hubConnections = {}, bagCounts = {} }
+env.MM2CoinCollector = state
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local player = Players.LocalPlayer
+
+local settings = {
+    Master = true, AutoFarm = true, AutoMurderer = true, AutoSheriff = true,
+    WaitForFullBag = true, AutoClaim = true, MovementPauses = true,
+    ESP = true, MurdererESP = true, SheriffESP = true, ESPNames = true,
+    CandyBoxes = true, KeyBoxes = true, RGB = true,
+    AimAssist = false, AutoGunPickup = false, AimKey = "MouseButton2",
+    AimHead = false,
+    Speed = 30, CoinDelay = 0.1, PauseInterval = 1, PauseDuration = 0.03
+}
+state.settings = settings
+local ranges = { Speed = { 8, 50 }, CoinDelay = { 0, 1 },
+    PauseInterval = { 0.25, 3 }, PauseDuration = { 0.01, 0.3 } }
+local defaults = table.clone(settings)
+local function validAimKey(value)
+    if type(value) ~= "string" then return false end
+    if value == "MouseButton1" or value == "MouseButton2" or value == "MouseButton3" then return true end
+    local ok, key = pcall(function() return Enum.KeyCode[value] end)
+    return ok and key ~= nil and key ~= Enum.KeyCode.Unknown and key ~= Enum.KeyCode.Escape
+end
+local function aimKeyLabel()
+    local labels = { MouseButton1 = "Left mouse", MouseButton2 = "Right mouse", MouseButton3 = "Middle mouse" }
+    return labels[settings.AimKey] or settings.AimKey
+end
+local HttpService = game:GetService("HttpService")
+local configFolder = "AstaMM2Hub"
+local configPath = configFolder .. "/config_" .. tostring(player.UserId) .. ".json"
+state.configPath = configPath
+local function applyConfig(values)
+    if type(values) ~= "table" then return false end
+    for key, default in pairs(defaults) do
+        local value = values[key]
+        if type(value) == type(default) then
+            if type(value) == "number" then
+                if value == value and math.abs(value) < math.huge then
+                    if ranges[key] then
+                        settings[key] = math.clamp(value, ranges[key][1], ranges[key][2])
+                    else
+                        settings[key] = value
+                    end
+                end
+            elseif key == "AimKey" then
+                if validAimKey(value) then settings[key] = value end
+            else settings[key] = value end
+        end
+    end
+    return true
+end
+if not state.preview then
+    applyConfig(env.AstaMM2SavedSettings)
+    if type(readfile) == "function" and type(isfile) == "function" then
+        local ok, loaded = pcall(function()
+            if not isfile(configPath) then return false end
+            local decoded = HttpService:JSONDecode(readfile(configPath))
+            assert(type(decoded) == "table" and decoded.version == 1, "Unsupported config")
+            assert(applyConfig(decoded.settings), "Invalid settings")
+            return true
+        end)
+        state.configStatus = ok and (loaded and "Config loaded" or "Ready / auto-save enabled")
+            or "Config unreadable / defaults retained"
+    else state.configStatus = "Session only / file API unavailable" end
+else state.configStatus = "Preview / config writes disabled" end
+
+local function saveConfig()
+    if state.preview then state.configStatus = "Preview / config writes disabled" return false end
+    env.AstaMM2SavedSettings = table.clone(settings)
+    if type(writefile) ~= "function" or type(makefolder) ~= "function"
+        or type(isfolder) ~= "function" then
+        state.configStatus = "Session only / file API unavailable"
+        return false
+    end
+    local ok = pcall(function()
+        if not isfolder(configFolder) then makefolder(configFolder) end
+        writefile(configPath, HttpService:JSONEncode({ version = 1, settings = settings }))
+    end)
+    state.configStatus = ok and "Saved automatically" or "Save failed / session copy retained"
+    return ok
+end
+state.saveConfig = saveConfig
+local movementSettings = { Master = true, AutoFarm = true, AutoMurderer = true,
+    AutoSheriff = true, WaitForFullBag = true, Speed = true,
+    AutoGunPickup = true,
+    MovementPauses = true, PauseInterval = true, PauseDuration = true }
+local function setSetting(key, value)
+    if settings[key] == nil then return end
+    if ranges[key] then
+        if type(value) ~= "number" or value ~= value then return end
+        value = math.clamp(value, ranges[key][1], ranges[key][2])
+    elseif key == "AimKey" then
+        if not validAimKey(value) then return end
+    elseif type(value) ~= "boolean" then return end
+    settings[key] = value
+    if state.releaseAim and (key == "AimKey" or ((key == "AimAssist" or key == "Master") and not value)) then
+        state.releaseAim()
+    end
+    -- Enabling a feature after Pause All resumes the hub without enabling other features.
+    if key ~= "Master" and type(value) == "boolean" and value then settings.Master = true end
+    if movementSettings[key] and state.tween then state.tween:Cancel() end
+    if state.refreshESP then pcall(state.refreshESP) end
+    saveConfig()
+end
+state.setSetting = setSetting
+state.pauseAll = function()
+    for key, value in pairs(settings) do
+        if type(value) == "boolean" then settings[key] = false end
+    end
+    state.aimKeyCapture = false
+    if state.releaseAim then state.releaseAim() end
+    if state.tween then state.tween:Cancel() end
+    if state.refreshESP then pcall(state.refreshESP) end
+    saveConfig()
+end
+state.resetSettings = function()
+    for key, value in pairs(defaults) do settings[key] = value end
+    if state.tween then state.tween:Cancel() end
+    if state.refreshESP then pcall(state.refreshESP) end
+    saveConfig()
+end
+local SHOT_DELAY = 2.5
+local STAB_DELAY = 1
+local SHOOT_RANGE = 100
+local CANDY_BOX_ID = "Halloween2026Box"
+local CANDY_CURRENCY = "Candies2026"
+local CANDY_BOX_PRICE = 600
+local BOX_KEY_CURRENCY = "HalloweenKey2026"
+local BOX_KEY_PRICE = 1
+
+local roleRemote = ReplicatedStorage:WaitForChild("Remotes")
+    :WaitForChild("Extras"):WaitForChild("GetPlayerData")
+local roundData = {}
+local lastShot = -math.huge
+local lastStab = -math.huge
+local retryAfter = setmetatable({}, { __mode = "k" })
+
+local function cancelTween()
+    if state.tween then
+        state.tween:Cancel()
+        state.tween = nil
+    end
+end
+
+local function getCharacter()
+    local character = player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if root and humanoid and humanoid.Health > 0 then
+        return character, root, humanoid
+    end
+end
+
+-- Refresh roles independently so ESP can update while moving.
+task.spawn(function()
+    while state.running do
+        local ok, data = pcall(function()
+            return roleRemote:InvokeServer()
+        end)
+        if not state.running then break end
+        roundData = ok and type(data) == "table" and data or {}
+        task.wait(1)
+    end
+end)
+
+local function isCoinBagFull()
+    local gui = player:FindFirstChildOfClass("PlayerGui")
+    local main = gui and gui:FindFirstChild("MainGUI")
+    local gameUI = main and main:FindFirstChild("Game")
+    local bags = gameUI and gameUI:FindFirstChild("CoinBags")
+    local container = bags and bags:FindFirstChild("Container")
+    if not container then return false end
+
+    for _, name in ipairs({ "Candy", "Coin" }) do
+        local bag = container:FindFirstChild(name)
+        if bag and bag:IsA("GuiObject") and bag.Visible then
+            local full = bag:FindFirstChild("Full")
+            local icon = bag:FindFirstChild("FullBagIcon")
+            if (full and full:IsA("GuiObject") and full.Visible)
+                or (icon and icon:IsA("GuiObject") and icon.Visible) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- Keep one tween and one destination; only pause/resume during long trips.
+local function moveStep(character, root, humanoid, destination, facing, stillNeeded)
+    if not state.running or not settings.Master or player.Character ~= character
+        or not root.Parent or humanoid.Health <= 0 then return end
+
+    local distance = (root.Position - destination).Magnitude
+    if distance <= 0.15 then return end
+
+    local goal = CFrame.new(destination) * root.CFrame.Rotation
+    if facing and (facing - destination).Magnitude > 0.01 then
+        goal = CFrame.lookAt(destination, facing)
+    end
+
+    local duration = math.max(distance / settings.Speed, 0.05)
+    local tween = TweenService:Create(root,
+        TweenInfo.new(duration, Enum.EasingStyle.Linear),
+        { CFrame = goal })
+    state.tween = tween
+    tween:Play()
+    local deadline = os.clock() + duration
+        + math.ceil(duration / settings.PauseInterval) * settings.PauseDuration + 2
+    local nextPause = os.clock() + settings.PauseInterval
+
+    local function interrupted()
+        return not state.running or not settings.Master or player.Character ~= character
+            or not root.Parent or humanoid.Health <= 0
+            or (stillNeeded and not stillNeeded())
+    end
+
+    while tween.PlaybackState == Enum.PlaybackState.Playing do
+        if interrupted() or os.clock() >= deadline then
+            tween:Cancel()
+            break
+        end
+        if settings.MovementPauses and os.clock() >= nextPause then
+            tween:Pause()
+            task.wait(settings.PauseDuration)
+            if interrupted() or tween.PlaybackState == Enum.PlaybackState.Cancelled then
+                tween:Cancel()
+                break
+            end
+            if tween.PlaybackState == Enum.PlaybackState.Paused then
+                tween:Play()
+            end
+            nextPause = os.clock() + settings.PauseInterval
+        end
+        task.wait(0.03)
+    end
+    if state.tween == tween then state.tween = nil end
+end
+
+local function getWeapon(character, name)
+    local backpack = player:FindFirstChildOfClass("Backpack")
+    local tool = character:FindFirstChild(name)
+        or (backpack and backpack:FindFirstChild(name))
+    if tool and tool:IsA("Tool") then return tool end
+end
+
+local function findTarget(root, sheriffMode)
+    local target, nearest = nil, math.huge
+    for _, other in Players:GetPlayers() do
+        local info = roundData[other.Name]
+        local character = other.Character
+        local otherRoot = character and character:FindFirstChild("HumanoidRootPart")
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if other ~= player and type(info) == "table"
+            and not info.Dead and not info.Killed
+            and (not sheriffMode or info.Role == "Murderer")
+            and other:GetAttribute("Alive") ~= false
+            and otherRoot and humanoid and humanoid.Health > 0
+            and not character:FindFirstChildOfClass("ForceField") then
+            local distance = (root.Position - otherRoot.Position).Magnitude
+            if distance < nearest then
+                nearest = distance
+                target = { player = other, character = character,
+                    root = otherRoot, humanoid = humanoid }
+            end
+        end
+    end
+    return target
+end
+
+local function targetAlive(target)
+    local info = roundData[target.player.Name]
+    return type(info) == "table" and not info.Dead and not info.Killed
+        and target.player.Character == target.character
+        and target.root.Parent ~= nil and target.humanoid.Health > 0
+        and target.player:GetAttribute("Alive") ~= false
+        and not target.character:FindFirstChildOfClass("ForceField")
+end
+
+local function clearShot(character, origin, destination, targetCharacter)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { character }
+    local hit = workspace:Raycast(origin, destination - origin, params)
+    return not hit or hit.Instance:IsDescendantOf(targetCharacter)
+end
+
+-- Aim Assist v3: restored the proven v1 Scriptable-camera lock while aiming.
+-- The v2 'Scriptable camera' veto could disable aim completely. V3 never vetoes it.
+local aimRunService = game:GetService("RunService")
+local aimInput = game:GetService("UserInputService")
+local aimLock, lockedTarget
+local windowFocused = true
+local buttonDown = {}
+
+-- Body aim by default; optional upper-chest/head aiming.
+local function getAimPoint(target)
+    local preferred
+    if settings.AimHead then
+        preferred = target.character:FindFirstChild("Head")
+    else
+        preferred = target.character:FindFirstChild("UpperTorso")
+            or target.character:FindFirstChild("Torso")
+    end
+    local part = preferred or target.root
+    local point = part.Position
+    if part == target.root then point = point + Vector3.new(0, 0.6, 0) end
+    if part.Name == "Head" then point = point - Vector3.new(0, 0.12, 0) end
+    return point, part.Name
+end
+
+-- Poll the live key state AND track events for input modes that swallow button presses.
+table.insert(state.hubConnections, aimInput.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+        buttonDown[input.KeyCode.Name] = true
+    else
+        local name = input.UserInputType.Name
+        if name == "MouseButton1" or name == "MouseButton2" or name == "MouseButton3" then
+            buttonDown[name] = true
+        end
+    end
+end))
+table.insert(state.hubConnections, aimInput.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+        buttonDown[input.KeyCode.Name] = nil
+    else
+        buttonDown[input.UserInputType.Name] = nil
+    end
+end))
+local function aimKeyHeld()
+    local key = settings.AimKey
+    if key == "MouseButton1" or key == "MouseButton2" or key == "MouseButton3" then
+        return buttonDown[key] or aimInput:IsMouseButtonPressed(Enum.UserInputType[key])
+    end
+    local keyEnum = Enum.KeyCode[key]
+    return buttonDown[key] or (keyEnum and aimInput:IsKeyDown(keyEnum)) or false
+end
+
+state.aimBinding = "AstaMM2Aim_" .. HttpService:GenerateGUID(false)
+state.releaseAim = function()
+    if aimLock then
+        local saved = aimLock
+        aimLock = nil
+        if saved.camera and saved.camera.Parent then
+            -- Restore Roblox's camera ownership and subject on release.
+            if saved.camera.CameraType == Enum.CameraType.Scriptable then
+                saved.camera.CameraType = saved.cameraType
+            end
+            if saved.subject and saved.subject.Parent then
+                saved.camera.CameraSubject = saved.subject
+            end
+        end
+        aimInput.MouseBehavior = saved.mouseBehavior
+    end
+    lockedTarget = nil
+    state.aimLocked = false
+    state.aimTargetPart = nil
+    state.aimErrorDegrees = nil
+end
+state.stopAim = function()
+    aimRunService:UnbindFromRenderStep(state.aimBinding)
+    state.releaseAim()
+end
+
+table.insert(state.hubConnections, aimInput.WindowFocusReleased:Connect(function()
+    windowFocused = false
+    buttonDown = {}
+    state.releaseAim()
+end))
+table.insert(state.hubConnections, aimInput.WindowFocused:Connect(function()
+    windowFocused = true
+end))
+
+local function updateAim(delta)
+    if not state.running then state.stopAim() return end
+    local function idle(message)
+        state.releaseAim()
+        state.aimStatus = message
+    end
+    if not settings.Master or not settings.AimAssist then idle("Disabled") return end
+    if not windowFocused then idle("Window inactive") return end
+    if state.aimKeyCapture then idle("Choosing activation key") return end
+    if aimInput:GetFocusedTextBox() then idle("Typing") return end
+    if not aimKeyHeld() then idle("Hold " .. aimKeyLabel() .. " to lock on") return end
+
+    local ownCharacter, root = getCharacter()
+    if not ownCharacter then idle("Waiting for character") return end
+    local ownInfo = roundData[player.Name]
+    if type(ownInfo) ~= "table" or ownInfo.Dead or ownInfo.Killed
+        or player:GetAttribute("Alive") == false then
+        idle("Waiting for active round") return
+    end
+    if ownInfo.Role == "Murderer" then idle("You are the Murderer") return end
+
+    local camera = workspace.CurrentCamera
+    if not camera then idle("Waiting for camera") return end
+    if lockedTarget then
+        local info = roundData[lockedTarget.player.Name]
+        if not targetAlive(lockedTarget) or type(info) ~= "table"
+            or info.Role ~= "Murderer" then
+            lockedTarget = nil
+        end
+    end
+    if not lockedTarget then
+        local candidate = findTarget(root, true)
+        if candidate then
+            lockedTarget = candidate
+        end
+    end
+    if not lockedTarget then idle("No living Murderer found") return end
+
+    local target = lockedTarget
+    local predicted, aimPart = getAimPoint(target)
+
+    -- Unlike v2, this lock works even if Roblox or another camera script
+    -- is using Scriptable mode. Save / restore the original camera state.
+    if aimLock and (aimLock.camera ~= camera or aimLock.character ~= ownCharacter) then
+        state.releaseAim()
+        lockedTarget = target
+    end
+    if not aimLock then
+        aimLock = {
+            camera = camera,
+            character = ownCharacter,
+            cameraType = camera.CameraType,
+            subject = camera.CameraSubject,
+            mouseBehavior = aimInput.MouseBehavior,
+            offset = camera.CFrame.Position - root.Position,
+            position = camera.CFrame.Position,
+        }
+    end
+    local desiredPosition = root.Position + aimLock.offset
+    local posAlpha = 1 - math.exp(-18 * math.clamp(delta, 0, 0.1))
+    aimLock.position = aimLock.position:Lerp(desiredPosition, posAlpha)
+    local origin = aimLock.position
+    if (predicted - origin).Magnitude < 0.1 then idle("Target too close") return end
+
+    camera.CameraType = Enum.CameraType.Scriptable
+    aimInput.MouseBehavior = Enum.MouseBehavior.LockCenter
+    local desired = CFrame.lookAt(origin, predicted)
+    camera.CFrame = desired
+    camera.Focus = CFrame.new(predicted)
+
+    local toTarget = (predicted - origin).Unit
+    state.aimErrorDegrees = math.deg(math.acos(math.clamp(
+        camera.CFrame.LookVector:Dot(toTarget), -1, 1)))
+    state.aimTargetPart = aimPart
+    state.aimLocked = true
+    state.aimStatus = "Locked: " .. target.player.DisplayName .. " (" .. aimPart .. ")"
+end
+
+-- Capture errors instead of silently losing every subsequent frame.
+local lastAimWarning = 0
+aimRunService:BindToRenderStep(state.aimBinding,
+    Enum.RenderPriority.Camera.Value + 1, function(delta)
+        local ok, err = pcall(updateAim, delta)
+        if not ok then
+            state.releaseAim()
+            state.aimStatus = "Aim error: " .. tostring(err)
+            if os.clock() - lastAimWarning >= 3 then
+                lastAimWarning = os.clock()
+                warn("Asta aimbot: " .. tostring(err))
+            end
+        end
+    end)
+
+local function handleCombat(character, root, humanoid, own)
+    local sheriffMode = own.Role == "Sheriff"
+    if not sheriffMode and own.Role ~= "Murderer" then return false end
+    local function combatEnabled()
+        local current = roundData[player.Name]
+        return state.running and settings.Master and type(current) == "table"
+            and current.Role == own.Role and not current.Dead and not current.Killed
+            and (sheriffMode and settings.AutoSheriff or not sheriffMode and settings.AutoMurderer)
+            and (not settings.WaitForFullBag or isCoinBagFull())
+    end
+    if not combatEnabled() then return false end
+    local weapon = getWeapon(character, sheriffMode and "Gun" or "Knife")
+    if not weapon then return false end
+    local target = findTarget(root, sheriffMode)
+    if not target then return false end
+    if weapon:GetAttribute("Disabled") == true then
+        task.wait(0.2)
+        return true
+    end
+    if weapon.Parent ~= character then
+        humanoid:EquipTool(weapon)
+        task.wait(0.2)
+    end
+    if not combatEnabled() or player.Character ~= character
+        or humanoid.Health <= 0 or weapon.Parent ~= character
+        or not targetAlive(target) then return true end
+
+    local distance = (root.Position - target.root.Position).Magnitude
+    if sheriffMode then
+        local attachment = root:FindFirstChild("GunRaycastAttachment")
+        local shoot = weapon:FindFirstChild("Shoot")
+        if attachment and attachment:IsA("Attachment")
+            and shoot and shoot:IsA("RemoteEvent") then
+            local aimPosition, unpredicted = getAimPoint(target)
+            local origin = attachment.WorldPosition
+            local head = character:FindFirstChild("Head")
+            local muzzleClear = head and clearShot(
+                character, head.Position, origin, target.character)
+            if distance <= SHOOT_RANGE and muzzleClear
+                and clearShot(character, origin, unpredicted, target.character) then
+                if os.clock() - lastShot >= SHOT_DELAY then
+                    lastShot = os.clock()
+                    shoot:FireServer(attachment.WorldCFrame, CFrame.new(aimPosition))
+                end
+                task.wait(0.15)
+                return true
+            end
+        end
+        local destination = (target.root.CFrame * CFrame.new(0, 0, 12)).Position
+        moveStep(character, root, humanoid, destination, target.root.Position, function()
+            return combatEnabled() and targetAlive(target)
+        end)
+    else
+        if distance > 3 then
+            local destination = (target.root.CFrame * CFrame.new(0, 0, 2)).Position
+            moveStep(character, root, humanoid, destination, target.root.Position, function()
+                return combatEnabled() and targetAlive(target)
+            end)
+        end
+        local currentOwn = roundData[player.Name]
+        if combatEnabled() and player.Character == character and humanoid.Health > 0
+            and type(currentOwn) == "table" and currentOwn.Role == "Murderer"
+            and not currentOwn.Dead and not currentOwn.Killed
+            and targetAlive(target) and weapon.Parent == character
+            and (root.Position - target.root.Position).Magnitude <= 4
+            and os.clock() - lastStab >= STAB_DELAY then
+            lastStab = os.clock()
+            weapon:Activate()
+        end
+        task.wait(0.1)
+    end
+    return true
+end
+
+local gunRetry = setmetatable({}, { __mode = "k" })
+local function collectDroppedGun(character, root, humanoid, own)
+    if not settings.Master or not settings.AutoGunPickup or own.Role == "Murderer"
+        or getWeapon(character, "Gun") then return false end
+    local nearest, target, part = math.huge, nil, nil
+    for _, drop in workspace:QueryDescendants("#GunDrop, #DroppedGun") do
+        local candidate = drop:IsA("BasePart") and drop
+            or (drop:IsA("Model") and (drop.PrimaryPart or drop:FindFirstChildWhichIsA("BasePart", true)))
+        if candidate and os.clock() >= (gunRetry[drop] or 0) then
+            local distance = (root.Position - candidate.Position).Magnitude
+            if distance < nearest then nearest, target, part = distance, drop, candidate end
+        end
+    end
+    if not target then return false end
+    state.mode = "Collecting dropped gun"
+    moveStep(character, root, humanoid, part.Position + Vector3.new(0, 2, 0), nil, function()
+        local current = roundData[player.Name]
+        return settings.AutoGunPickup and target:IsDescendantOf(workspace)
+            and part:IsDescendantOf(workspace) and not getWeapon(character, "Gun")
+            and type(current) == "table" and current.Role ~= "Murderer"
+            and not current.Dead and not current.Killed
+    end)
+    if not state.running or not settings.Master or not settings.AutoGunPickup then return true end
+    local deadline = os.clock() + 0.6
+    while state.running and settings.Master and settings.AutoGunPickup
+        and player.Character == character and humanoid.Health > 0
+        and target:IsDescendantOf(workspace) and not getWeapon(character, "Gun")
+        and os.clock() < deadline do task.wait(0.05) end
+    if not getWeapon(character, "Gun") then gunRetry[target] = os.clock() + 3 end
+    return true
+end
+
+local function collectCoin(character, root, humanoid)
+    if not settings.Master or not settings.AutoFarm then return end
+    local target, nearest = nil, math.huge
+    for _, coin in workspace:QueryDescendants("#CoinContainer > #Coin_Server") do
+        if coin:IsA("BasePart") and coin:GetAttribute("Collected") ~= true
+            and os.clock() >= (retryAfter[coin] or 0) then
+            local distance = (root.Position - coin.Position).Magnitude
+            if distance < nearest then
+                nearest, target = distance, coin
+            end
+        end
+    end
+    if not target then task.wait(0.5) return end
+    local destination = target.Position + Vector3.new(0, 2, 0)
+    moveStep(character, root, humanoid, destination, nil, function()
+        return settings.Master and settings.AutoFarm
+            and target.Parent ~= nil and target:GetAttribute("Collected") ~= true
+            and not isCoinBagFull()
+    end)
+    if not state.running or not settings.Master or not settings.AutoFarm
+        or player.Character ~= character then return end
+    -- Allow the collection flag to update instead of assuming proximity is success.
+    local confirmDeadline = os.clock() + 0.3
+    while state.running and settings.Master and settings.AutoFarm
+        and player.Character == character and humanoid.Health > 0
+        and target.Parent and target:GetAttribute("Collected") ~= true
+        and not isCoinBagFull() and os.clock() < confirmDeadline do
+        task.wait(0.03)
+    end
+    if not state.running or player.Character ~= character then return end
+    if target.Parent and target:GetAttribute("Collected") ~= true then
+        retryAfter[target] = os.clock() + 2
+    end
+    task.wait(settings.CoinDelay)
+end
+
+local function isVisible(button, gui)
+    if not button.Active then return false end
+    local current = button
+    while current and current ~= gui do
+        if current:IsA("GuiObject") and not current.Visible then return false end
+        if current:IsA("ScreenGui") and not current.Enabled then return false end
+        current = current.Parent
+    end
+    return current == gui
+end
+
+-- Auto Claim.
+task.spawn(function()
+    local lastClaim = -math.huge
+    while state.running do
+        local ok, err = pcall(function()
+            local gui = player:FindFirstChildOfClass("PlayerGui")
+            if not settings.Master or not settings.AutoClaim
+                or not gui or os.clock() - lastClaim < 2 then return end
+            local crossPlatform = gui:FindFirstChild("CrossPlatform")
+            local popup = crossPlatform and crossPlatform:FindFirstChild("NewItem")
+            local medium = popup and popup:FindFirstChild("Medium")
+            local container = medium and medium:FindFirstChild("Container")
+            local button = container and container:FindFirstChild("Claim")
+            if state.running and button and button:IsA("GuiButton")
+                and isVisible(button, gui) then
+                lastClaim = os.clock()
+                firesignal(button.Activated)
+            end
+        end)
+        if not ok then
+            warn("Auto Claim: " .. tostring(err))
+            task.wait(2)
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- Buy one Halloween box when the confirmed balance covers its price.
+-- Keep a shared pending record across script restarts to avoid duplicate requests.
+task.spawn(function()
+    local initialized, setupError = pcall(function()
+        local profile = require(ReplicatedStorage.Modules.ProfileData)
+        local sync = require(ReplicatedStorage.Database.Sync)
+        local policy = require(ReplicatedStorage.ClientServices.PolicyManager)
+        local shop = ReplicatedStorage.Remotes.Shop
+        local nextAttempt = 0
+
+        local function balance(currency)
+            local owned = profile.Materials and profile.Materials.Owned
+            return owned and tonumber(owned[currency]) or 0
+        end
+
+        local function popupOpen()
+            local gui = player:FindFirstChildOfClass("PlayerGui")
+            if not gui then return true end
+            if gui:FindFirstChild("MysteryBoxOpen") then return true end
+            local cross = gui:FindFirstChild("CrossPlatform")
+            local popup = cross and cross:FindFirstChild("NewItem")
+            local medium = popup and popup:FindFirstChild("Medium")
+            local container = medium and medium:FindFirstChild("Container")
+            local claim = container and container:FindFirstChild("Claim")
+            return claim and claim:IsA("GuiButton") and isVisible(claim, gui)
+        end
+
+        while state.running do
+            local current = balance(CANDY_CURRENCY)
+            local keys = balance(BOX_KEY_CURRENCY)
+            local pending = env.MM2CandyPurchasePending
+
+            if pending then
+                state.purchaseStatus = "Waiting for purchase confirmation"
+                -- Never reissue while the previous server call is unresolved.
+                -- Older script copies stored Candy purchases without currency/price.
+                local pendingCurrency = pending.currency or CANDY_CURRENCY
+                local pendingPrice = pending.price or CANDY_BOX_PRICE
+                if pending.finished
+                    and balance(pendingCurrency) <= pending.before - pendingPrice then
+                    env.MM2CandyPurchasePending = nil
+                    nextAttempt = os.clock() + 8
+                end
+            elseif settings.Master and (settings.CandyBoxes or settings.KeyBoxes)
+                and os.clock() >= nextAttempt then
+                local box = sync.NewShop and sync.NewShop[CANDY_BOX_ID]
+                local prices = box and box.Price or {}
+                local currency, price, available
+                -- Spend event keys first; otherwise use 600 Candy.
+                if settings.KeyBoxes and keys >= BOX_KEY_PRICE
+                    and prices[BOX_KEY_CURRENCY] == BOX_KEY_PRICE then
+                    currency, price, available = BOX_KEY_CURRENCY, BOX_KEY_PRICE, keys
+                elseif settings.CandyBoxes and current >= CANDY_BOX_PRICE
+                    and prices[CANDY_CURRENCY] == CANDY_BOX_PRICE then
+                    currency, price, available = CANDY_CURRENCY, CANDY_BOX_PRICE, current
+                end
+                if policy.ArePaidRandomItemsRestricted ~= false then
+                    state.purchaseStatus = "Random boxes unavailable for this account"
+                elseif not currency then
+                    state.purchaseStatus = "Waiting for 1 Halloween key or 600 Candy; keys="
+                        .. keys .. ", Candy=" .. current
+                elseif not popupOpen() and state.running then
+                    local transaction = { before = available, finished = false,
+                        currency = currency, price = price }
+                    env.MM2CandyPurchasePending = transaction
+                    state.purchaseStatus = "Opening Halloween Box '26 with " .. currency
+
+                    local ok, reward = pcall(function()
+                        return shop.OpenCrate:InvokeServer(
+                            CANDY_BOX_ID, "MysteryBox", currency)
+                    end)
+                    transaction.finished = true
+
+                    if ok and reward then
+                        state.cratesOpened = state.cratesOpened + 1
+                        transaction.reward = reward
+                        state.purchaseStatus = "Purchased; waiting for balance update"
+                        -- Use the game's normal opening and reward presentation.
+                        local shown, showError = pcall(function()
+                            shop.BoxController:Fire({ {
+                                MysteryBoxId = CANDY_BOX_ID,
+                                RewardedItemId = reward
+                            } })
+                        end)
+                        if not shown then warn("Box display: " .. tostring(showError)) end
+                    elseif ok then
+                        -- The server explicitly rejected the purchase.
+                        if env.MM2CandyPurchasePending == transaction then
+                            env.MM2CandyPurchasePending = nil
+                        end
+                        state.purchaseStatus = "Purchase rejected; waiting before retry"
+                        nextAttempt = os.clock() + 15
+                    else
+                        -- An uncertain response must not immediately cause another spend.
+                        state.purchaseStatus = "Uncertain purchase; waiting for balance confirmation"
+                        warn("Box purchase: " .. tostring(reward))
+                    end
+                end
+            end
+            task.wait(2)
+        end
+    end)
+    if not initialized then
+        state.purchaseStatus = "Auto-buy stopped: " .. tostring(setupError)
+        warn(state.purchaseStatus)
+    end
+end)
+
+-- Local ESP: red Murderer, blue Sheriff, with role labels.
+local espFolder = Instance.new("Folder")
+espFolder.Name = "MM2RoleESP"
+espFolder.Parent = workspace
+state.espFolder = espFolder
+local espEntries = {}
+local roleColors = {
+    Murderer = Color3.fromRGB(255, 60, 60),
+    Sheriff = Color3.fromRGB(60, 150, 255)
+}
+
+local function removeESP(other)
+    local entry = espEntries[other]
+    if entry then
+        entry.highlight:Destroy()
+        entry.billboard:Destroy()
+        espEntries[other] = nil
+    end
+end
+
+local function updateESP()
+    local seen = {}
+    for _, other in Players:GetPlayers() do
+        local info = roundData[other.Name]
+        local character = other.Character
+        local head = character and character:FindFirstChild("Head")
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local color = type(info) == "table" and roleColors[info.Role]
+        local roleEnabled = type(info) == "table" and
+            ((info.Role == "Murderer" and settings.MurdererESP)
+            or (info.Role == "Sheriff" and settings.SheriffESP))
+        if settings.Master and settings.ESP and roleEnabled
+            and other ~= player and color and head and humanoid
+            and humanoid.Health > 0 and not info.Dead and not info.Killed
+            and other:GetAttribute("Alive") ~= false then
+            seen[other] = true
+            local entry = espEntries[other]
+            if entry and (entry.character ~= character
+                or entry.billboard.Adornee ~= head) then
+                removeESP(other)
+                entry = nil
+            end
+            if not entry then
+                local highlight = Instance.new("Highlight")
+                highlight.Name = "RoleHighlight"
+                highlight.Adornee = character
+                highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                highlight.FillTransparency = 0.65
+                highlight.OutlineTransparency = 0
+                highlight.FillColor = color
+                highlight.OutlineColor = color
+                highlight.Parent = espFolder
+
+                local billboard = Instance.new("BillboardGui")
+                billboard.Name = "RoleLabel"
+                billboard.Adornee = head
+                billboard.AlwaysOnTop = true
+                billboard.Size = UDim2.fromOffset(220, 44)
+                billboard.StudsOffsetWorldSpace = Vector3.new(0, 3, 0)
+                billboard.MaxDistance = 1500
+                billboard.Parent = espFolder
+
+                local label = Instance.new("TextLabel")
+                label.Size = UDim2.fromScale(1, 1)
+                label.BackgroundTransparency = 1
+                label.Font = Enum.Font.GothamBold
+                label.TextSize = 15
+                label.TextStrokeTransparency = 0.2
+                label.TextColor3 = color
+                label.Parent = billboard
+                entry = { character = character, highlight = highlight,
+                    billboard = billboard, label = label }
+                espEntries[other] = entry
+            end
+            entry.highlight.FillColor = color
+            entry.highlight.OutlineColor = color
+            entry.label.TextColor3 = color
+            entry.label.Text = info.Role .. "\n" .. other.DisplayName
+            entry.billboard.Enabled = settings.ESPNames
+        end
+    end
+    local expired = {}
+    for other in pairs(espEntries) do
+        if not seen[other] then table.insert(expired, other) end
+    end
+    for _, other in ipairs(expired) do removeESP(other) end
+end
+
+state.refreshESP = updateESP
+task.spawn(function()
+    while state.running do
+        local ok, err = pcall(updateESP)
+        if not ok then
+            warn("Role ESP: " .. tostring(err))
+            task.wait(1)
+        end
+        task.wait(0.25)
+    end
+    espFolder:Destroy()
+end)
+
+-- Coins first; combat starts only when the bag is full.
+task.spawn(function()
+    while state.running do
+        local ok, err = pcall(function()
+            if not settings.Master then state.mode = "Paused" task.wait(0.2) return end
+            local character, root, humanoid = getCharacter()
+            if not character then state.mode = "Waiting for character" task.wait(0.5) return end
+            local own = roundData[player.Name]
+            if type(own) ~= "table" or own.Dead or own.Killed
+                or player:GetAttribute("Alive") == false then
+                state.mode = "Waiting for round"
+                task.wait(0.5)
+                return
+            end
+            local full = isCoinBagFull()
+            if collectDroppedGun(character, root, humanoid, own) then return end
+            if (full or not settings.WaitForFullBag)
+                and handleCombat(character, root, humanoid, own) then return end
+            if settings.AutoFarm and not full then
+                state.mode = "Collecting coins"
+                collectCoin(character, root, humanoid)
+                return
+            end
+            state.mode = settings.WaitForFullBag and not full
+                and "Waiting for full bag" or "Idle"
+            task.wait(0.2)
+        end)
+        if not ok then
+            cancelTween()
+            state.mode = "Retrying"
+            warn("MM2 automation: " .. tostring(err))
+            task.wait(1)
+        end
+        task.wait(0.05)
+    end
+    cancelTween()
+end)
+
+-- ASTA_HUB_UI_START
+task.spawn(function()
+    local Input = game:GetService("UserInputService")
+    local profile = require(ReplicatedStorage.Modules.ProfileData)
+    local palette = {
+        background = Color3.fromRGB(13, 17, 31),
+        card = Color3.fromRGB(23, 29, 48),
+        text = Color3.fromRGB(239, 243, 255),
+        muted = Color3.fromRGB(145, 159, 188),
+        violet = Color3.fromRGB(162, 123, 255),
+        cyan = Color3.fromRGB(71, 221, 225),
+        line = Color3.fromRGB(45, 55, 82),
+        gold = Color3.fromRGB(255, 205, 117)
+    }
+    local function make(className, properties, parent)
+        local object = Instance.new(className)
+        for key, value in pairs(properties) do object[key] = value end
+        object.Parent = parent
+        return object
+    end
+    local function corner(parent, radius)
+        make("UICorner", { CornerRadius = UDim.new(0, radius) }, parent)
+    end
+    local function text(parent, value, x, y, width, height, size, color, bold)
+        return make("TextLabel", {
+            BackgroundTransparency = 1, Position = UDim2.fromOffset(x, y),
+            Size = UDim2.fromOffset(width, height), Text = value,
+            Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham,
+            TextSize = size, TextColor3 = color,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd
+        }, parent)
+    end
+    local function connect(signal, callback)
+        local connection = signal:Connect(callback)
+        table.insert(state.hubConnections, connection)
+        return connection
+    end
+    local gui = make("ScreenGui", {
+        Name = "AstaMM2Hub", ResetOnSpawn = false,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 100
+    }, player:WaitForChild("PlayerGui"))
+    state.hubGui = gui
+    local panel = make("Frame", {
+        Name = "Dashboard", Position = UDim2.fromOffset(24, 100),
+        Size = UDim2.fromOffset(360, 520), BackgroundColor3 = palette.background,
+        BorderSizePixel = 0, Active = true
+    }, gui)
+    corner(panel, 18)
+    local border = make("UIStroke", { Color = palette.violet, Thickness = 1.3, Transparency = 0.42 }, panel)
+    local scale = make("UIScale", { Scale = 1 }, panel)
+    local accent = make("Frame", {
+        Position = UDim2.fromOffset(18, 0), Size = UDim2.new(1, -36, 0, 3),
+        BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0
+    }, panel)
+    local accentGradient = make("UIGradient", { Color = ColorSequence.new(palette.violet, palette.cyan) }, accent)
+    corner(accent, 3)
+
+    local header = make("Frame", {
+        BackgroundTransparency = 1, Size = UDim2.new(1, -54, 0, 76), Active = true
+    }, panel)
+    local badge = make("Frame", {
+        Position = UDim2.fromOffset(18, 20), Size = UDim2.fromOffset(38, 38),
+        BackgroundColor3 = Color3.fromRGB(48, 37, 79), BorderSizePixel = 0
+    }, header)
+    corner(badge, 12)
+    local monogram = text(badge, "A", 0, 0, 38, 38, 23, palette.violet, true)
+    monogram.TextXAlignment = Enum.TextXAlignment.Center
+    text(header, "Asta MM2 Hub", 68, 18, 220, 27, 21, palette.text, true)
+    text(header, "Player Stats", 69, 47, 90, 16, 11, palette.muted, false)
+    local rgbDots = {}
+    for index = 1, 3 do
+        local rgbDot = make("Frame", {
+            Position = UDim2.fromOffset(151 + (index - 1) * 12, 52),
+            Size = UDim2.fromOffset(5, 5), BorderSizePixel = 0,
+            BackgroundColor3 = palette.violet
+        }, header)
+        corner(rgbDot, 5)
+        rgbDots[index] = rgbDot
+    end
+    local minimize = make("TextButton", {
+        Position = UDim2.new(1, -46, 0, 23), Size = UDim2.fromOffset(28, 28),
+        BackgroundColor3 = palette.card, BorderSizePixel = 0, Text = "−",
+        Font = Enum.Font.GothamBold, TextSize = 22, TextColor3 = palette.muted
+    }, panel)
+    corner(minimize, 9)
+    local body = make("Frame", {
+        Name = "StatsPage", BackgroundTransparency = 1, Position = UDim2.fromOffset(18, 126),
+        Size = UDim2.fromOffset(324, 330)
+    }, panel)
+    text(body, "ROUND BAG", 0, 5, 170, 17, 10, palette.muted, true)
+    local bagText = text(body, "— / —", 180, 2, 144, 22, 15, palette.text, true)
+    bagText.TextXAlignment = Enum.TextXAlignment.Right
+    local track = make("Frame", {
+        Position = UDim2.fromOffset(0, 32), Size = UDim2.fromOffset(324, 8),
+        BackgroundColor3 = palette.card, BorderSizePixel = 0, ClipsDescendants = true
+    }, body)
+    corner(track, 4)
+    local fill = make("Frame", {
+        Size = UDim2.fromScale(0, 1), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0
+    }, track)
+    corner(fill, 4)
+    make("UIGradient", { Color = ColorSequence.new(palette.violet, palette.cyan) }, fill)
+
+    local function metric(title, x, y, color)
+        local card = make("Frame", {
+            Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(156, 66),
+            BackgroundColor3 = palette.card, BorderSizePixel = 0
+        }, body)
+        corner(card, 11)
+        text(card, title, 13, 10, 132, 13, 9, palette.muted, true)
+        return text(card, "—", 13, 28, 132, 29, 23, color, true)
+    end
+    local candyText = metric("CANDY BALANCE", 0, 56, palette.violet)
+    local keysText = metric("HALLOWEEN KEYS", 168, 56, palette.gold)
+    local cratesText = metric("BOXES / THIS SESSION", 0, 134, palette.cyan)
+    local levelText = metric("PLAYER LEVEL", 168, 134, palette.text)
+    text(body, "Auto open Chest with 1 key or 600 candy", 0, 210, 324, 18, 10, palette.muted, false)
+    make("Frame", {
+        Position = UDim2.fromOffset(0, 237), Size = UDim2.fromOffset(324, 1),
+        BackgroundColor3 = palette.line, BorderSizePixel = 0
+    }, body)
+    local userText = text(body, "@" .. player.Name, 0, 250, 216, 18, 12, palette.text, true)
+    local uptimeText = text(body, "SESSION  00:00:00", 0, 274, 216, 16, 10, palette.muted, false)
+    local stop = make("TextButton", {
+        Name = "MasterButton", Position = UDim2.fromOffset(238, 474), Size = UDim2.fromOffset(104, 30),
+        BackgroundColor3 = Color3.fromRGB(65, 34, 52), BorderSizePixel = 0,
+        Text = "PAUSE ALL", Font = Enum.Font.GothamBold, TextSize = 10,
+        TextColor3 = Color3.fromRGB(255, 153, 176)
+    }, panel)
+    corner(stop, 10)
+
+    local pages, tabs, controlRefreshers = { Stats = body }, {}, {}
+    local activeTab = "Stats"
+    for _, name in ipairs({ "Gameplay", "Visuals", "Shop", "Config" }) do
+        local page = make("ScrollingFrame", {
+            Name = name .. "Page", BackgroundTransparency = 1, BorderSizePixel = 0,
+            Position = UDim2.fromOffset(18, 126), Size = UDim2.fromOffset(324, 330),
+            CanvasSize = UDim2.fromOffset(0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            ScrollBarThickness = 3, ScrollBarImageColor3 = palette.violet,
+            ScrollingDirection = Enum.ScrollingDirection.Y, Visible = false
+        }, panel)
+        make("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }, page)
+        make("UIPadding", { PaddingBottom = UDim.new(0, 8), PaddingRight = UDim.new(0, 6) }, page)
+        pages[name] = page
+    end
+    local tabBar = make("Frame", {
+        Name = "Tabs", Position = UDim2.fromOffset(18, 82),
+        Size = UDim2.fromOffset(324, 32), BackgroundTransparency = 1
+    }, panel)
+    local function selectTab(name)
+        activeTab = name
+        for pageName, page in pairs(pages) do page.Visible = pageName == name end
+        for tabName, button in pairs(tabs) do
+            button.BackgroundColor3 = tabName == name and Color3.fromRGB(53, 42, 88) or palette.card
+            button.TextColor3 = tabName == name and palette.violet or palette.muted
+        end
+    end
+    for index, name in ipairs({ "Stats", "Gameplay", "Visuals", "Shop", "Config" }) do
+        local tab = make("TextButton", {
+            Name = name, Position = UDim2.fromOffset((index - 1) * 66, 0),
+            Size = UDim2.fromOffset(60, 32), BackgroundColor3 = palette.card,
+            BorderSizePixel = 0, Text = name, Font = Enum.Font.GothamBold,
+            TextSize = 10, TextColor3 = palette.muted, AutoButtonColor = false
+        }, tabBar)
+        corner(tab, 9)
+        tabs[name] = tab
+        connect(tab.Activated, function() selectTab(name) end)
+    end
+    local order = 0
+    local function controlCard(page, key, height)
+        order = order + 1
+        local card = make("Frame", {
+            Name = key, LayoutOrder = order, Size = UDim2.new(1, 0, 0, height),
+            BackgroundColor3 = palette.card, BorderSizePixel = 0
+        }, pages[page])
+        corner(card, 10)
+        return card
+    end
+    local function toggle(page, key, title, description)
+        local card = controlCard(page, key, 64)
+        text(card, title, 12, 10, 222, 19, 12, palette.text, true)
+        local note = text(card, description, 12, 31, 232, 25, 10, palette.muted, false)
+        note.TextWrapped = true
+        note.TextTruncate = Enum.TextTruncate.None
+        local button = make("TextButton", {
+            Name = "Toggle", Position = UDim2.new(1, -60, 0, 19),
+            Size = UDim2.fromOffset(48, 26), BackgroundColor3 = palette.line,
+            Text = "", BorderSizePixel = 0, AutoButtonColor = false
+        }, card)
+        corner(button, 13)
+        local knob = make("Frame", {
+            Name = "Knob", Position = UDim2.fromOffset(4, 4), Size = UDim2.fromOffset(18, 18),
+            BackgroundColor3 = palette.text, BorderSizePixel = 0
+        }, button)
+        corner(knob, 9)
+        local function refresh()
+            local enabled = settings[key]
+            button.BackgroundColor3 = enabled and palette.violet or palette.line
+            knob.Position = UDim2.fromOffset(enabled and 26 or 4, 4)
+            button:SetAttribute("Enabled", enabled)
+            if key == "AimAssist" then
+                note.Text = enabled and (state.aimStatus or ("Hold " .. aimKeyLabel() .. ". No weapon required.")) or description
+            end
+        end
+        connect(button.Activated, function()
+            setSetting(key, not settings[key])
+            refresh()
+        end)
+        table.insert(controlRefreshers, refresh)
+        refresh()
+    end
+    local function stepper(page, key, title, step, format)
+        local card = controlCard(page, key, 58)
+        text(card, title, 12, 8, 175, 18, 12, palette.text, true)
+        local value = text(card, "", 12, 29, 175, 18, 11, palette.cyan, true)
+        for _, direction in ipairs({ -1, 1 }) do
+            local button = make("TextButton", {
+                Name = direction == -1 and "Decrease" or "Increase",
+                Position = UDim2.new(1, direction == -1 and -88 or -48, 0, 13),
+                Size = UDim2.fromOffset(32, 32), BackgroundColor3 = palette.line,
+                BorderSizePixel = 0, Text = direction == -1 and "−" or "+",
+                Font = Enum.Font.GothamBold, TextSize = 18, TextColor3 = palette.text
+            }, card)
+            corner(button, 9)
+            connect(button.Activated, function()
+                setSetting(key, math.round((settings[key] + direction * step) * 100) / 100)
+                value.Text = string.format(format, settings[key])
+            end)
+        end
+        local function refresh() value.Text = string.format(format, settings[key]) end
+        table.insert(controlRefreshers, refresh)
+        refresh()
+    end
+    toggle("Gameplay", "AutoFarm", "Auto collect coins", "Collect the nearest available coins.")
+    toggle("Gameplay", "WaitForFullBag", "Fill bag before combat", "Combat waits for a full coin bag.")
+    toggle("Gameplay", "AutoMurderer", "Murderer mode", "Chase players when you are Murderer.")
+    toggle("Gameplay", "AutoSheriff", "Sheriff mode", "Target only the Murderer.")
+    toggle("Gameplay", "AimAssist", "Murderer aimbot", "Hold your activation key.")
+    toggle("Gameplay", "AimHead", "Head priority", "On: aim at head. Off: more reliable torso aim.")
+    local keyCard = controlCard("Gameplay", "AimKey", 76)
+    text(keyCard, "Aimbot activation key", 12, 9, 190, 20, 12, palette.text, true)
+    local keyValue = text(keyCard, aimKeyLabel(), 12, 32, 185, 18, 11, palette.cyan, true)
+    text(keyCard, "Hold to aim / Esc cancels rebinding", 12, 54, 290, 13, 9, palette.muted, false)
+    local keyButton = make("TextButton", {
+        Name = "ChangeKey", Position = UDim2.new(1, -116, 0, 17),
+        Size = UDim2.fromOffset(104, 30), BackgroundColor3 = palette.line,
+        BorderSizePixel = 0, Text = "Change key", Font = Enum.Font.GothamBold,
+        TextSize = 10, TextColor3 = palette.text
+    }, keyCard)
+    corner(keyButton, 9)
+    local captureAfter, captureDeadline = 0, 0
+    connect(keyButton.Activated, function()
+        state.aimKeyCapture = not state.aimKeyCapture
+        captureAfter = os.clock() + 0.2
+        captureDeadline = os.clock() + 10
+    end)
+    connect(Input.InputBegan, function(input)
+        if not state.aimKeyCapture or os.clock() < captureAfter then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            for _, object in ipairs(player.PlayerGui:GetGuiObjectsAtPosition(input.Position.X, input.Position.Y)) do
+                if object == keyButton or object:IsDescendantOf(keyButton) then return end
+            end
+        end
+        if input.KeyCode == Enum.KeyCode.Escape then state.aimKeyCapture = false return end
+        local value
+        if input.UserInputType == Enum.UserInputType.Keyboard then value = input.KeyCode.Name
+        elseif input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.MouseButton2
+            or input.UserInputType == Enum.UserInputType.MouseButton3 then value = input.UserInputType.Name end
+        if value and validAimKey(value) then
+            state.aimKeyCapture = false
+            setSetting("AimKey", value)
+        end
+    end)
+    table.insert(controlRefreshers, function()
+        if state.aimKeyCapture and os.clock() >= captureDeadline then state.aimKeyCapture = false end
+        keyValue.Text = state.aimKeyCapture and "Press a key or mouse button" or aimKeyLabel()
+        keyButton.Text = state.aimKeyCapture and "Cancel" or "Change key"
+    end)
+    toggle("Gameplay", "AutoGunPickup", "Collect dropped gun", "Prioritize a dropped gun before coins.")
+    toggle("Gameplay", "AutoClaim", "Auto Claim", "Claim reward popups automatically.")
+    toggle("Visuals", "ESP", "Enable ESP", "Show role highlights through walls.")
+    toggle("Visuals", "MurdererESP", "Murderer highlight", "Red outline for the Murderer.")
+    toggle("Visuals", "SheriffESP", "Sheriff highlight", "Blue outline for the Sheriff.")
+    toggle("Visuals", "ESPNames", "Role and name labels", "Display labels above highlighted players.")
+    toggle("Visuals", "RGB", "Animated RGB accents", "Color sweep across the header and border.")
+    toggle("Shop", "KeyBoxes", "Open with Halloween keys", "Use 1 key first when available.")
+    toggle("Shop", "CandyBoxes", "Open with Candy", "Spend 600 Candy only when available.")
+    local shopNote = controlCard("Shop", "PurchaseNote", 90)
+    local shopText = text(shopNote, "Auto open Chest with 1 key or 600 candy", 12, 10, 292, 32, 11, palette.cyan, true)
+    shopText.TextWrapped = true
+    shopText.TextTruncate = Enum.TextTruncate.None
+    local note = text(shopNote, "An opening already sent finishes even if you turn the toggle off.", 12, 43, 292, 36, 10, palette.muted, false)
+    note.TextWrapped = true
+    note.TextTruncate = Enum.TextTruncate.None
+    local configCard = controlCard("Config", "ConfigInfo", 88)
+    text(configCard, "Load/Save Config", 12, 12, 290, 22, 14, palette.text, true)
+    local configStatus = text(configCard, state.configStatus or "Ready", 12, 43, 290, 34, 11, palette.cyan, true)
+    configStatus.TextWrapped = true
+    configStatus.TextTruncate = Enum.TextTruncate.None
+    local function configAction(name, title, callback)
+        local row = controlCard("Config", name, 46)
+        local button = make("TextButton", {
+            Name = "Action", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+            Text = title, TextColor3 = palette.text, Font = Enum.Font.GothamBold, TextSize = 12
+        }, row)
+        connect(button.Activated, callback)
+    end
+    configAction("Save", "Save settings now", function() state.saveConfig() end)
+    configAction("Reset", "Reset to defaults", function() state.resetSettings() end)
+    table.insert(controlRefreshers, function()
+        configStatus.Text = state.configStatus == "Config loaded" and "Config Loaded"
+            or state.configStatus or "Ready"
+    end)
+    selectTab("Stats")
+
+    local collapsed, dragging, dragInput, dragStart, startPosition = false, false
+    connect(minimize.Activated, function()
+        collapsed = not collapsed
+        for name, page in pairs(pages) do page.Visible = not collapsed and name == activeTab end
+        tabBar.Visible = not collapsed
+        stop.Visible = not collapsed
+        panel.Size = UDim2.fromOffset(360, collapsed and 76 or 520)
+        minimize.Text = collapsed and "+" or "−"
+    end)
+    connect(header.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPosition = true, input.Position, panel.Position
+            dragInput = input
+        end
+    end)
+    connect(Input.InputEnded, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input == dragInput then
+            dragging = false
+        end
+    end)
+    connect(Input.InputChanged, function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input == dragInput) then
+            local delta = input.Position - dragStart
+            local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize
+            local x = startPosition.X.Offset + delta.X
+            local y = startPosition.Y.Offset + delta.Y
+            if viewport then
+                x = math.clamp(x, 0, math.max(0, viewport.X - 360 * scale.Scale))
+                y = math.clamp(y, 0, math.max(0, viewport.Y - 100))
+            end
+            panel.Position = UDim2.fromOffset(x, y)
+        end
+    end)
+    connect(stop.Activated, function()
+        state.pauseAll()
+        for _, refresh in ipairs(controlRefreshers) do refresh() end
+    end)
+
+    local gameplay = ReplicatedStorage.Remotes:FindFirstChild("Gameplay")
+    local collected = gameplay and gameplay:FindFirstChild("CoinCollected")
+    local started = gameplay and gameplay:FindFirstChild("CoinsStarted")
+    if collected then
+        connect(collected.OnClientEvent, function(id, amount, capacity)
+            if (id == "Candy" or id == "Coin") and tonumber(amount) then
+                state.bagCounts[id] = { amount = tonumber(amount), capacity = tonumber(capacity) }
+            end
+        end)
+    end
+    if started then
+        connect(started.OnClientEvent, function()
+            state.bagCounts = {}
+        end)
+    end
+
+    local function readBag()
+        local main = player.PlayerGui:FindFirstChild("MainGUI")
+        local gameUI = main and main:FindFirstChild("Game")
+        local bags = gameUI and gameUI:FindFirstChild("CoinBags")
+        local container = bags and bags:FindFirstChild("Container")
+        if container then
+            for _, id in ipairs({ "Candy", "Coin" }) do
+                local bag = container:FindFirstChild(id)
+                if bag and bag.Visible then
+                    local known = state.bagCounts[id]
+                    local currency = bag:FindFirstChild("CurrencyFrame")
+                    local icon = currency and currency:FindFirstChild("Icon")
+                    local coins = icon and icon:FindFirstChild("Coins")
+                    local amount = coins and tonumber(coins.Text)
+                    return amount or (known and known.amount), known and known.capacity
+                end
+            end
+        end
+    end
+    -- Slow RGB sweep, limited to 30 updates/second and disconnected on shutdown.
+    local rgbElapsed = 0
+    connect(game:GetService("RunService").Heartbeat, function(delta)
+        rgbElapsed = rgbElapsed + delta
+        if rgbElapsed < 1 / 30 or not state.running or not gui.Parent then return end
+        rgbElapsed = 0
+        local hue = (os.clock() / 16) % 1
+        local first = settings.RGB and Color3.fromHSV(hue, 0.55, 1) or palette.violet
+        local middle = settings.RGB and Color3.fromHSV((hue + 0.16) % 1, 0.55, 1) or palette.violet
+        local last = settings.RGB and Color3.fromHSV((hue + 0.32) % 1, 0.55, 1) or palette.cyan
+        accentGradient.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, first),
+            ColorSequenceKeypoint.new(0.5, middle),
+            ColorSequenceKeypoint.new(1, last)
+        })
+        border.Color = first
+        monogram.TextColor3 = first
+        for index, rgbDot in ipairs(rgbDots) do
+            rgbDot.BackgroundColor3 = settings.RGB
+                and Color3.fromHSV((hue + (index - 1) * 0.16) % 1, 0.55, 1) or palette.violet
+        end
+    end)
+    while state.running and gui.Parent do
+        local ok, err = pcall(function()
+            for _, refresh in ipairs(controlRefreshers) do refresh() end
+            stop.Text = "PAUSE ALL"
+            local owned = profile.Materials and profile.Materials.Owned or {}
+            candyText.Text = tostring(owned.Candies2026 or 0)
+            keysText.Text = tostring(owned.HalloweenKey2026 or 0)
+            cratesText.Text = tostring(state.cratesOpened or 0)
+            levelText.Text = tostring(player:GetAttribute("Level") or "—")
+            local amount, capacity = readBag()
+            bagText.Text = tostring(amount or "—") .. " / " .. tostring(capacity or "—")
+            fill.Size = UDim2.fromScale(
+                amount and capacity and capacity > 0 and math.clamp(amount / capacity, 0, 1) or 0, 1)
+            local elapsed = math.floor(os.clock() - state.startedAt)
+            uptimeText.Text = string.format("SESSION  %02d:%02d:%02d",
+                math.floor(elapsed / 3600), math.floor(elapsed / 60) % 60, elapsed % 60)
+            local camera = workspace.CurrentCamera
+            if camera then
+                scale.Scale = math.clamp(math.min((camera.ViewportSize.X - 32) / 360,
+                    (camera.ViewportSize.Y - 80) / 520), 0.5, 1)
+            end
+        end)
+        if not ok then warn("Asta UI: " .. tostring(err)) end
+        task.wait(0.25)
+    end
+    for _, connection in ipairs(state.hubConnections) do connection:Disconnect() end
+    if state.stopAim then state.stopAim() end
+    gui:Destroy()
+end)
